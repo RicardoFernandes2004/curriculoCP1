@@ -87,7 +87,7 @@ def sanity_check():
     try:
         client = get_bq_client()
         df = client.query("SELECT 1 AS ok", location=BQ_LOCATION).result().to_dataframe()
-        st.success(f"Conexão BigQuery OK (projeto: **{client.project}**). Retorno: {df.iloc[0]['ok']}")
+        st.success(f"Conexão BigQuery OK!")
         return True
     except Exception as e:
         st.error("Falha ao conectar no BigQuery. Verifique Service Account, roles e billing.")
