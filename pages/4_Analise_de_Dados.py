@@ -1,3 +1,6 @@
+# pages/4_Analise_de_Dados.py
+# Analise GitHub (BigQuery) – PROD: SA via secrets, cache, status, location=US
+
 import math
 import numpy as np
 import pandas as pd
@@ -6,16 +9,22 @@ import streamlit as st
 from datetime import datetime
 from google.cloud import bigquery
 from google.cloud.bigquery import QueryJobConfig
+from google.oauth2 import service_account
 
 # ===============================
-# Config e título
+# CONFIG GLOBAL
 # ===============================
-st.set_page_config(page_title="Análise de Dados: GitHub (BigQuery)", layout="wide")
-st.title("Análise de Dados: GitHub (BigQuery Public Datasets)")
+PAGE_TITLE = "🔎 Análise de Dados (GitHub - BigQuery)"
+BQ_LOCATION = "US"  # datasets públicos costumam ficar em US
+DEFAULT_TOP_N = 20
+DEFAULT_SAMPLE_PCT = 10
+
+st.set_page_config(page_title="Análise de Dados", layout="wide")
+st.title(PAGE_TITLE)
 st.caption("Foco de engenharia: modelagem por repositório, custo/escala, métricas, inferência e explicabilidade.")
 
 # ===============================
-# Helpers (formatação e BigQuery)
+# HELPERS GERAIS
 # ===============================
 def fmt_num(x, fmt="{:.3f}", fallback="—"):
     try:
@@ -39,129 +48,113 @@ def human_bytes(n: int) -> str:
     if n is None or n < 0:
         return "?"
     units = ["B", "KB", "MB", "GB", "TB"]
-    i = 0
-    x = float(n)
+    i, x = 0, float(n)
     while x >= 1024 and i < len(units) - 1:
         x /= 1024
         i += 1
     return f"{x:,.2f} {units[i]}"
 
+# ===============================
+# AUTENTICAÇÃO / CLIENTE BQ
+# ===============================
 @st.cache_resource(show_spinner=False)
 def get_bq_client():
-    return bigquery.Client()
+    if "gcp_service_account" in st.secrets:  # deploy
+        creds = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        return bigquery.Client(credentials=creds, project=creds.project_id)
+    return bigquery.Client()  # local (ADC via gcloud)
 
-def run_query(sql: str, job_config: QueryJobConfig | None = None) -> tuple[pd.DataFrame, int]:
-    job = client.query(sql, job_config=job_config)
+@st.cache_data(show_spinner=False)
+def bq_estimate_bytes(sql: str) -> int:
+    client = get_bq_client()
+    qcfg = QueryJobConfig(dry_run=True, use_query_cache=False)
+    job = client.query(sql, location=BQ_LOCATION, job_config=qcfg)
+    return int(job.total_bytes_processed)
+
+@st.cache_data(show_spinner=False)
+def bq_query(sql: str) -> tuple[pd.DataFrame, int]:
+    """Retorna (DataFrame, bytes processados)."""
+    client = get_bq_client()
+    job = client.query(sql, location=BQ_LOCATION)
     df = job.result().to_dataframe()
     bytes_processed = getattr(job, "total_bytes_processed", None)
     return df, (int(bytes_processed) if bytes_processed is not None else -1)
 
-def estimate_bytes(sql: str) -> int:
-    qcfg = QueryJobConfig(dry_run=True, use_query_cache=False)
-    job = client.query(sql, job_config=qcfg)
-    return int(job.total_bytes_processed)
+def sanity_check():
+    try:
+        client = get_bq_client()
+        df = client.query("SELECT 1 AS ok", location=BQ_LOCATION).result().to_dataframe()
+        st.success(f"Conexão BigQuery OK (projeto: **{client.project}**). Retorno: {df.iloc[0]['ok']}")
+        return True
+    except Exception as e:
+        st.error("Falha ao conectar no BigQuery. Verifique Service Account, roles e billing.")
+        st.exception(e)
+        return False
 
 # ===============================
-# Sidebar (controles)
+# SIDEBAR (CONTROLES)
 # ===============================
-st.sidebar.header("Configurações")
-sample_pct = st.sidebar.select_slider(
-    "Amostragem por repositório (estável via FARM_FINGERPRINT)",
-    options=[1, 2, 5, 10, 20, 50, 100],
-    value=10,
-    key="sample_pct",
-    help="Amostra estável por hash de repo_name: reduz custo mantendo representatividade."
-)
+with st.sidebar:
+    st.header("Configurações")
+    sample_pct = st.select_slider("Amostragem por repositório",
+                                  options=[1, 2, 5, 10, 20, 50, 100],
+                                  value=DEFAULT_SAMPLE_PCT,
+                                  help="Amostra estável por hash do repo_name: reduz custo mantendo representatividade.")
+    top_n = st.slider("Top-N linguagens por bytes (global)", 5, 30, DEFAULT_TOP_N, 1)
+    scale = st.radio("Escala para tamanhos de repositório", ["log10", "linear"], index=0)
+    calc_correlation = st.checkbox("Calcular correlação (r, p, IC)", value=True)
+    calc_test = st.checkbox("Teste de hipótese (Welch: multilíngues > monolíngues)", value=True)
 
-top_n = st.sidebar.slider(
-    "Top-N linguagens por bytes (global)",
-    min_value=5, max_value=30, value=20, step=1, key="top_n"
-)
-
-scale = st.sidebar.radio(
-    "Escala para tamanhos de repositório",
-    options=["log10", "linear"],
-    index=0,
-    help="Distribuição é de cauda pesada; log10 facilita a leitura."
-)
-
-calc_correlation = st.sidebar.checkbox("Calcular correlação (r, p, IC)", value=True)
-calc_test = st.sidebar.checkbox("Teste de hipótese (Welch: multilíngues > monolíngues)", value=True)
-
-st.sidebar.divider()
-st.sidebar.caption("Se necessário: `gcloud auth application-default login` e habilitar BigQuery API no seu projeto.")
+    st.divider()
+    if st.button("🔄 Atualizar dados (limpar cache)"):
+        st.cache_data.clear()
+        st.success("Cache limpo. Rode novamente as consultas.")
 
 # ===============================
-# Intro
+# INTRO (contexto + ideia do trabalho)
 # ===============================
 def render_intro():
     st.header("Contexto e ideia do trabalho")
     st.write(
         """
-        Este projeto simula um cenário real de **engenharia de dados / back-end** para entrevista técnica:
-        partir de dados públicos em larga escala, transformar eventos de código em **evidências quantitativas**
-        e produzir **insights acionáveis** com **custo controlado**. O foco é **raciocínio de produção**:
-        modelagem por repositório, transparência das consultas, controle de custos e **inferência estatística**.
+        Projeto no estilo entrevista técnica de **engenharia de dados / back-end**:
+        a partir de dados públicos em larga escala, transformamos eventos de código em **evidências quantitativas**
+        e **insights acionáveis**, com **custo controlado** e **inferência estatística**. O foco é **raciocínio de produção**:
+        modelagem por repositório, transparência das queries, amostragem estável e leitura executiva dos resultados.
         """
     )
-
     st.subheader("Base de dados (o que é e como será usada)")
     st.write(
         """
-        Utilizo o conjunto público **GitHub on BigQuery** (`bigquery-public-data.github_repos.languages`).
-        Após expandir o campo `language` com `UNNEST`, cada registro representa **(repositório, linguagem, bytes)**.
-        Para responder às perguntas, construo uma visão **por repositório** com:
-        1) **Linguagem dominante** (a que mais acumula bytes no repo),  
-        2) **Tamanho total** do repositório em bytes (soma de todas as linguagens),  
-        3) **Número de linguagens** distintas por repositório.
+        Conjunto público **GitHub on BigQuery** (`bigquery-public-data.github_repos.languages`).
+        Após `UNNEST(language)`, cada registro representa **(repositório, linguagem, bytes)**.
+        A visão por repositório inclui: (i) **linguagem dominante**, (ii) **tamanho total** (bytes) e (iii) **número de linguagens**.
         """
     )
-
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.info(f"**Amostragem estável**\n\n~**{st.session_state.get('sample_pct', sample_pct)}%** via `FARM_FINGERPRINT(repo_name)` para reduzir custo.")
+        st.info(f"**Amostragem estável**\n\n~**{sample_pct}%** via `FARM_FINGERPRINT(repo_name)` para reduzir custo.")
     with c2:
-        st.info(f"**Top linguagens**\n\nExibo **Top-{st.session_state.get('top_n', top_n)}** por bytes para evidenciar concentração.")
+        st.info(f"**Top linguagens**\n\nExibo **Top-{top_n}** por bytes para evidenciar concentração.")
     with c3:
         st.info("**Tratamento estatístico**\n\nUso `log10(total_bytes+1)` para lidar com **cauda pesada**.")
-
     st.subheader("Perguntas norteadoras")
     st.markdown(
         f"""
-        - Quais linguagens acumulam maior **volume de código** (Top-{st.session_state.get('top_n', top_n)})?
-        - Repositórios **multilíngues** (≥2 linguagens) tendem a ser **maiores** do que **monolíngues**?
+        - Quais linguagens acumulam maior **volume de código** (Top-{top_n})?  
+        - Repositórios **multilíngues** (≥2 linguagens) tendem a ser **maiores** do que **monolíngues**?  
         - Qual a **relação** entre **número de linguagens** e **tamanho** do repositório?
         """
     )
-
-    st.subheader("Metodologia (resumo prático)")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown(
-            """
-            **Modelagem e custo**
-            - Agrego por repositório → `dominant_language`, `total_bytes`, `num_languages`.
-            - **Amostragem estável** por hash (barata e reprodutível).
-            - **Cache** das consultas e **queries transparentes** no app.
-            """
-        )
-    with col_b:
-        st.markdown(
-            """
-            **Estatística e inferência**
-            - Exploração: Top-N, histogramas/boxplots e medidas centrais por linguagem dominante.
-            - Correlação: **Pearson** entre `num_languages` e `log10(total_bytes)` com **IC 95%**.
-            - Hipótese: **Welch’s t-test** (variâncias possivelmente diferentes) comparando
-              **multilíngues vs monolíngues**, com **Δ em log10**, **IC 95%** e **fator multiplicativo** na escala original.
-            """
-        )
-
     st.divider()
 
 render_intro()
 
 # ===============================
-# Tipos de variáveis
+# TIPOS DE VARIÁVEIS
 # ===============================
 st.subheader("Tipos de variáveis (nomenclatura formal)")
 tipos_df = pd.DataFrame([
@@ -171,22 +164,20 @@ tipos_df = pd.DataFrame([
     ["total_bytes", "Quantitativa (Contínua)", "Razão", "Soma de bytes do repo; zero possível; dobrar/triplicar tem interpretação."],
     ["num_languages", "Quantitativa (Discreta)", "Razão", "Contagem de linguagens distintas no repo."],
     ["dominant_language", "Qualitativa (Nominal)", "Nominal", "Linguagem com mais bytes no repo."],
-    ["log10_total_bytes", "Quantitativa (Contínua)", "Intervalar*", "Transformação para estabilizar cauda pesada (*diferenças em log viram razões na escala original*)."],
+    ["log10_total_bytes", "Quantitativa (Contínua)", "Intervalar*", "Transformação para cauda pesada (*diferenças em log viram razões na escala original*)."],
 ], columns=["Variável", "Tipo estatístico", "Escala de medida", "Observações"])
 st.dataframe(tipos_df, use_container_width=True)
-st.caption("Obs.: **Razão** possui zero absoluto e permite interpretações multiplicativas; **log10** torna a análise robusta em cauda pesada.")
+st.caption("Obs.: **Razão** tem zero absoluto e permite interpretações multiplicativas; **log10** estabiliza variância.")
 
 # ===============================
-# Cliente BigQuery
+# SANITY CHECK (BigQuery)
 # ===============================
-try:
-    client = get_bq_client()
-except Exception as e:
-    st.error(f"Não consegui criar o cliente do BigQuery: {e}")
+st.subheader("Conexão BigQuery")
+if not sanity_check():
     st.stop()
 
 # ===============================
-# Queries (dinâmicas)
+# QUERIES
 # ===============================
 sql_top_langs = f"""
 SELECT
@@ -230,36 +221,36 @@ WHERE rn = 1
 """
 
 # ===============================
-# Estimativas de custo e execução
+# ESTIMATIVA DE CUSTO + EXECUÇÃO
 # ===============================
+st.subheader("Execução das consultas")
 col_est1, col_est2 = st.columns(2)
 with col_est1:
     try:
-        est_top = estimate_bytes(sql_top_langs)
+        est_top = bq_estimate_bytes(sql_top_langs)
         st.info(f"Estimativa Top Linguagens: {human_bytes(est_top)}")
     except Exception:
         st.info("Estimativa Top Linguagens indisponível (ok).")
-
 with col_est2:
     try:
-        est_repo = estimate_bytes(sql_per_repo)
-        warn = "⚠️" if est_repo > 5 * 1024**3 else ""
-        st.info(f"{warn} Estimativa Visão por Repo (amostra {sample_pct}%): {human_bytes(est_repo)}")
+        est_repo = bq_estimate_bytes(sql_per_repo)
+        st.info(f"Estimativa Visão por Repo (amostra {sample_pct}%): {human_bytes(est_repo)}")
     except Exception:
         st.info("Estimativa por Repo indisponível (ok).")
 
-st.write("Rodando consultas…")
-df_top, bytes_top = run_query(sql_top_langs)
-df_repo, bytes_repo = run_query(sql_per_repo)
+with st.status("Consultando BigQuery…", expanded=False) as s:
+    df_top, bytes_top = bq_query(sql_top_langs)
+    df_repo, bytes_repo = bq_query(sql_per_repo)
+    s.update(label="Consultas concluídas ✅", state="complete")
 
 colb1, colb2 = st.columns(2)
 with colb1:
-    st.success(f"Top Linguagens — Bytes processados: {human_bytes(bytes_top)}")
+    st.success(f"Top Linguagens — bytes processados: {human_bytes(bytes_top)}")
 with colb2:
-    st.success(f"Visão por Repo — Bytes processados: {human_bytes(bytes_repo)} (amostra {sample_pct}%)")
+    st.success(f"Visão por Repo — bytes processados: {human_bytes(bytes_repo)} (amostra {sample_pct}%)")
 
 # ===============================
-# 2) Exploração: medidas, distribuições e correlação
+# EXPLORAÇÃO
 # ===============================
 st.header("Exploração: medidas, distribuições e correlação")
 
@@ -278,13 +269,20 @@ bar = (
 )
 st.altair_chart(bar, use_container_width=True)
 
-top_total = df_top["total_bytes"].sum() if len(df_top) else np.nan
-top1_name = df_top.iloc[0]["language_name"] if len(df_top) else None
-top1_share = (df_top.iloc[0]["total_bytes"] / top_total) * 100 if len(df_top) else np.nan
-top3_share = (df_top.iloc[:3]["total_bytes"].sum() / top_total) * 100 if len(df_top) >= 3 else np.nan
+# métricas para relatório
+if len(df_top) >= 1:
+    top_total = df_top["total_bytes"].sum()
+    top1_name = df_top.iloc[0]["language_name"]
+    top1_share = (df_top.iloc[0]["total_bytes"] / top_total) * 100 if top_total else np.nan
+    top3_share = (df_top.iloc[:3]["total_bytes"].sum() / top_total) * 100 if len(df_top) >= 3 and top_total else np.nan
+else:
+    top_total = np.nan
+    top1_name = None
+    top1_share = np.nan
+    top3_share = np.nan
+
 st.markdown(
-    f"**Comentário:** No **Top-{top_n}**, **{top1_name or '—'}** concentra **{fmt_pct(top1_share)}**; as **3 primeiras** somam **{fmt_pct(top3_share)}**. "
-    "Padrão de **concentração** típico em dados de larga escala."
+    f"**Comentário:** No **Top-{top_n}**, **{top1_name or '—'}** concentra **{fmt_pct(top1_share)}**; as **3 primeiras** somam **{fmt_pct(top3_share)}** — indício de **concentração**."
 )
 
 # 2.2 Medidas por linguagem dominante
@@ -339,8 +337,7 @@ with right:
     st.altair_chart(box, use_container_width=True)
 
 st.markdown(
-    "**Comentário:** histograma com **assimetria à direita** (muitos repos pequenos, poucos gigantes). "
-    "No boxplot, observe **dispersão intra-grupo** e **outliers**; em **log10**, as diferenças ficam mais legíveis."
+    "**Comentário:** histograma com **assimetria à direita** (muitos repos pequenos, poucos gigantes). No boxplot, observe **dispersão intra-grupo** e **outliers**."
 )
 
 # 2.4 Correlação
@@ -355,8 +352,7 @@ if calc_correlation:
     if n >= 4:
         r, p = stats.pearsonr(corr_df["num_languages"], corr_df["log10_total_bytes"])
         z = np.arctanh(r); se = 1 / math.sqrt(n - 3)
-        from scipy import stats as ststats
-        zcrit = ststats.norm.ppf(0.975)
+        zcrit = stats.norm.ppf(0.975)
         r_low, r_high = np.tanh([z - zcrit*se, z + zcrit*se])
         abs_r = abs(r)
         if abs_r < 0.1: mag = "muito fraca"
@@ -394,10 +390,9 @@ if corr_success:
     )
 
 # ===============================
-# 3) Inferência: IC 95% e Teste de hipótese (Welch)
+# INFERÊNCIA (Welch)
 # ===============================
-st.header("Inferência: IC 95% e Teste de hipótese")
-
+st.header("Inferência: IC 95% e Teste de hipótese (Welch)")
 def welch_t_ci(a: np.ndarray, b: np.ndarray, alpha=0.05):
     from scipy import stats
     a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
@@ -468,93 +463,133 @@ if test_success:
         f"(IC95% do fator: **×{fmt_num(fator_l, '{:.2f}')}** a **×{fmt_num(fator_u, '{:.2f}')}**). "
         "Em termos simples: repositórios com 2+ linguagens tendem a ser **maiores**."
     )
-    st.markdown(
-        "_Nota:_ o **Welch** é adequado quando os grupos podem ter variâncias diferentes e tamanhos desbalanceados; "
-        "trabalhar em **log10** torna a comparação mais robusta e dá interpretação em **razões de tamanho**."
-    )
+    st.markdown("_Nota:_ o **Welch** evita assumir variâncias iguais; trabalhar em **log10** dá leitura em **razões de tamanho**.")
 
 # ===============================
-# 4) Relatório textual consolidado (+ download)
+# RELATÓRIO TEXTUAL (Markdown caprichado)
 # ===============================
 st.header("Relatório textual")
-st.caption("Parágrafos gerados automaticamente com base nos resultados acima.")
 
-def build_report_text():
-    # Bloco apresentação / ideia
-    intro = f"""
-**Apresentação da base.**
-Uso o conjunto público GitHub on BigQuery (`bigquery-public-data.github_repos.languages`).
-Após `UNNEST(language)`, cada registro representa (repositório, linguagem, bytes).
-A visão por repositório inclui: (i) linguagem dominante, (ii) tamanho total (bytes) e (iii) número de linguagens distintas.
-
-**Perguntas.**
-Top-{top_n} por volume, multilíngues (≥2) são maiores que monolíngues? Qual a relação entre nº de linguagens e tamanho?
-"""
-
-    # Tipos de variáveis
-    tipos = """
-**Tipos de variáveis.**
-Qualitativas (Nominal): repo_name, language_name, dominant_language.
-Quantitativas: Discreta — num_languages; Contínua (Razão) — bytes e total_bytes.
-Transformação: log10(total_bytes+1) para lidar com cauda pesada.
-"""
-
-    # Exploração com números dinâmicos
-    expl = f"""
-**Exploração descritiva.**
-Concentração: no Top-{top_n}, {top1_name or '—'} ≈ {fmt_pct(top1_share)}; as 3 primeiras ≈ {fmt_pct(top3_share)}.
-Distribuição: assimetria à direita; em log10, comparações de grupos ficam mais robustas.
-Medidas por linguagem dominante: médias/medianas (log) e desvios indicam diferenças com variabilidade intra-grupo.
-"""
+def build_report_md(ctx: dict, *, calc_corr: bool, calc_test: bool) -> str:
+    # Top linguagens (sempre aparece)
+    top_lang_txt = (
+        f"- **Linguagem líder:** **{ctx.get('top1_name') or '—'}** · **Participação:** {fmt_pct(ctx.get('top1_share'))}\n"
+        f"- **Top 3 linguagens (soma):** {fmt_pct(ctx.get('top3_share'))}"
+    )
 
     # Correlação
-    if calc_correlation and corr_success:
-        corr_txt = f"Correlação: r={fmt_num(r)}, IC95% [{fmt_num(r_low)}; {fmt_num(r_high)}], p={fmt_num(p, '{:.3g}')}. Magnitude: {mag}."
-    else:
-        corr_txt = "Correlação: não calculada neste run (opção desmarcada ou amostra insuficiente)."
-
-    # Teste
-    if calc_test and test_success:
-        test_txt = (
-            f"Teste de hipótese (Welch) em log10(total_bytes+1): Δ={fmt_num(diff)} "
-            f"(IC95% [{fmt_num(lci)}; {fmt_num(uci)}], p(one-sided)={fmt_num(p_one, '{:.3g}')}). "
-            f"Equivale a fator ≈ ×{fmt_num(fator, '{:.2f}')} (IC95% ×{fmt_num(fator_l, '{:.2f}')}–×{fmt_num(fator_u, '{:.2f}')}), "
-            f"indicando que multilíngues tendem a ser maiores."
+    if calc_corr and ctx.get("corr_success"):
+        corr_txt = (
+            f"- **Correlação (r):** {fmt_num(ctx.get('r'))} ({ctx.get('mag', '—')})\n"
+            f"- **IC 95% de r:** [{fmt_num(ctx.get('r_low'))}; {fmt_num(ctx.get('r_high'))}]\n"
+            f"- **p-valor:** {fmt_num(ctx.get('p'), '{:.3g}')}\n"
+            f"- **Leitura:** mais linguagens → tendência a repositórios maiores (em log10)."
         )
     else:
-        test_txt = "Teste de hipótese (Welch): não executado neste run (opção desmarcada ou amostra insuficiente)."
+        corr_txt = "- **Correlação:** não calculada neste run (opção desmarcada ou amostra insuficiente)."
 
-    # Conclusões e limitações
-    concl = """
-**Conclusões.**
-(1) Padrão de concentração por linguagem; (2) cauda pesada → log10 é apropriado;
-(3) relação positiva (fraca–moderada) entre nº de linguagens e tamanho; (4) efeito significativo: multilíngues > monolíngues.
+    # Teste de hipótese
+    if calc_test and ctx.get("test_success"):
+        test_txt = (
+            f"- **Δ média (log10):** {fmt_num(ctx.get('diff'))}  |  **t:** {fmt_num(ctx.get('tval'), '{:.2f}')}  |  **df≈** {fmt_num(ctx.get('dfw'), '{:.0f}')}\n"
+            f"- **IC 95% (Δ):** [{fmt_num(ctx.get('lci'))}; {fmt_num(ctx.get('uci'))}]  |  **p (one-sided):** {fmt_num(ctx.get('p_one'), '{:.3g}')}\n"
+            f"- **Fator multiplicativo (bytes):** ×{fmt_num(ctx.get('fator'), '{:.2f}')} "
+            f"(IC95% ×{fmt_num(ctx.get('fator_l'), '{:.2f}')}–×{fmt_num(ctx.get('fator_u'), '{:.2f}')} )\n"
+            f"- **Conclusão:** repositórios **multilíngues** tendem a ser **maiores** que **monolíngues**."
+        )
+    else:
+        test_txt = "- **Teste (Welch):** não executado neste run (opção desmarcada ou amostra insuficiente)."
 
-**Limitações.**
-Bytes ≠ qualidade/popularidade; possível viés por monorepos/espelhos; causalidade fora de escopo.
+    md_sections = [
+f"""## 1) Contexto e ideia
 
-**Próximos passos.**
-Segmentar por ecossistema (Python/JS/Java); analisar séries temporais (GitHub Archive);
-expor resultados via endpoints para consumo por outros serviços.
-"""
+Projeto no estilo entrevista de **engenharia de dados / back-end**: dados públicos em larga escala → **evidências quantitativas**
+e **insights acionáveis** com custo controlado. Foco em **raciocínio de produção**: modelagem por repositório,
+queries transparentes, amostragem estável e inferência com IC/teste.""",
 
-    return "\n".join([intro.strip(), tipos.strip(), expl.strip(), corr_txt.strip(), test_txt.strip(), concl.strip()])
+"""## 2) Base de dados
 
-report_text = build_report_text()
-with st.expander("Mostrar/ocultar relatório", expanded=True):
-    st.markdown(report_text)
+- **Fonte:** `bigquery-public-data.github_repos.languages`
+- **Unidade após UNNEST:** (repositório, linguagem, bytes)
+- **Visão por repositório:** linguagem dominante · total de bytes · número de linguagens""",
 
+f"""## 3) Perguntas
+
+- Quais linguagens acumulam mais **volume de código** (Top-{ctx.get('top_n')})?
+- Repositórios **multilíngues** (≥2 linguagens) tendem a ser **maiores** do que monolíngues?
+- Qual a **relação** entre **nº de linguagens** e **tamanho** do repositório?""",
+
+f"""## 4) Resultados descritivos
+
+**Top-{ctx.get('top_n')} por volume**
+{top_lang_txt}
+
+**Distribuições e medidas**
+- `total_bytes` tem **assimetria à direita** (cauda pesada); análise em **log10** melhora a robustez.
+- Medianas/boxplots por **linguagem dominante** mostram diferenças com variabilidade intra-grupo.""",
+
+f"""## 5) Correlação (nº linguagens × tamanho em log10)
+
+{corr_txt}""",
+
+f"""## 6) Teste de hipótese (Welch — multilíngues > monolíngues)
+
+{test_txt}""",
+
+"""## 7) Conclusões
+
+- **Concentração:** poucas linguagens carregam a maior parte do volume de código.
+- **Cauda pesada:** trabalhar em **log10** é apropriado.
+- **Relação positiva:** mais linguagens costuma vir com repositórios **maiores** (efeito fraco–moderado).
+- **Inferência:** evidência de **multilíngues > monolíngues** em média (com leitura em **razões de tamanho**).""",
+
+"""## 8) Limitações e próximos passos
+
+- **Bytes ≠ qualidade/popularidade**; possíveis vieses (monorepos, mirrors).
+- **Sem causalidade:** análise é descritiva/inferencial, não causal.
+- **Extensões:** segmentar por ecossistema, adicionar séries temporais (GitHub Archive), expor métricas via API."""
+    ]
+
+    return "\n\n".join(md_sections).strip()
+
+# montar o contexto com TUDO que o relatório precisa
+ctx = {
+    "top_n": top_n,
+    "top1_name": top1_name,
+    "top1_share": top1_share,
+    "top3_share": top3_share,
+    "corr_success": corr_success,
+    "r": r, "p": p, "r_low": r_low, "r_high": r_high, "mag": mag,
+    "test_success": test_success,
+    "diff": diff, "tval": tval, "dfw": dfw, "lci": lci, "uci": uci, "p_one": p_one,
+    "fator": fator, "fator_l": fator_l, "fator_u": fator_u,
+}
+
+report_md = build_report_md(ctx, calc_corr=calc_correlation, calc_test=calc_test)
+
+with st.expander("📄 Visualizar relatório (Markdown)", expanded=True):
+    st.markdown(report_md)
+    st.caption("Copiar texto puro / colar no Docs:")
+    st.code(report_md, language="markdown")
+
+# Downloads (MD e TXT)
 st.download_button(
-    "Baixar relatório (TXT)",
-    data=report_text.encode("utf-8"),
+    "⬇️ Baixar relatório (.md)",
+    data=report_md.encode("utf-8"),
+    file_name="relatorio_github_bigquery.md",
+    mime="text/markdown",
+)
+st.download_button(
+    "⬇️ Baixar relatório (.txt)",
+    data=report_md.replace("#", "").encode("utf-8"),
     file_name="relatorio_github_bigquery.txt",
-    mime="text/plain"
+    mime="text/plain",
 )
 
 # ===============================
-# Rodapé
+# RODAPÉ
 # ===============================
 st.caption(
-    f"Última execução: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-    f"Amostra por repo: {sample_pct}% | Top-N linguagens: {top_n} | Escala: {scale}"
+    f"Última execução: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • "
+    f"Amostra: {sample_pct}% • Top-N: {top_n} • Escala: {scale} • Região BQ: {BQ_LOCATION}"
 )
